@@ -1,1 +1,6 @@
+📂 Dataset
+The dataset follows the below structure: Sentiment_Analysis/ │── train/ │ ├── pos/ (Positive reviews) │ ├── neg/ (Negative reviews) │ ├── unsup/ (Unsupervised reviews) │ │── test/ │ ├── pos/(Positive reviews) │ ├── neg/(Negative reviews)
 
+Labeled data: 25k positive and negative reviews for training/testing
+Unlabeled data: Used to train Word2Vec embeddings and improve predictions
+Source: IMDB review dataset (publicly available)
