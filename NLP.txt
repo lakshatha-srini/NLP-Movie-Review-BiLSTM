@@ -1,0 +1,304 @@
+# 1.Import necessary libraries
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+from gensim.models import Word2Vec
+from nltk.corpus import stopwords
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout, Bidirectional
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.metrics import classification_report
+import pickle
+
+# Initialize pandarallel for faster processing
+from pandarallel import pandarallel
+pandarallel.initialize(progress_bar=True)
+
+# Download stopwords from NLTK
+import nltk
+nltk.download('stopwords')
+
+# Create a set of English stopwords
+stop_words = set(stopwords.words('english'))
+
+
+#2.Base dataset path (adjust if needed)
+base_path = "Sentiment_Analysis/Sentiment_Analysis"
+
+# Paths for train/test/unsupervised folders
+train_pos = os.path.join(base_path, "train/pos")
+train_neg = os.path.join(base_path, "train/neg")
+train_unsup = os.path.join(base_path, "train/unsup")
+test_pos = os.path.join(base_path, "test/pos")
+test_neg = os.path.join(base_path, "test/neg")
+
+# Function to load labeled data
+def load_labeled_reviews(folder, label):
+    """Load all reviews from folder and assign a label."""
+    files = glob.glob(os.path.join(folder, "*.txt"))
+    data = []
+    for f in files:
+        with open(f, encoding='utf-8') as file:
+            data.append((file.read(), label))
+    return data
+
+# Function to load unsupervised (unlabeled) data
+def load_unsupervised_data(folder):
+    """Load all reviews from folder without labels."""
+    files = glob.glob(os.path.join(folder, "*.txt"))
+    texts = []
+    for f in files:
+        with open(f, encoding='utf-8') as file:
+            texts.append(file.read())
+    return texts
+
+# Function to clean text
+def clean_text(text):
+    """Lowercase, remove HTML, punctuation, numbers, and stopwords."""
+    text = text.lower()
+    text = re.sub(r'<.*?>', '', text)                
+    text = re.sub(r'[^a-z\s]', '', text)             
+    text = re.sub(r'\s+', ' ', text).strip()         
+    tokens = text.split()
+    tokens = [t for t in tokens if t not in stop_words]
+    return ' '.join(tokens)
+
+
+#3.Load all labeled and unlabeled data
+print("Loading labeled train and test data...")
+train_pos_data = load_labeled_reviews(train_pos, 1)
+train_neg_data = load_labeled_reviews(train_neg, 0)
+test_pos_data = load_labeled_reviews(test_pos, 1)
+test_neg_data = load_labeled_reviews(test_neg, 0)
+
+print("Loading unsupervised train data...")
+unsup_texts = load_unsupervised_data(train_unsup)
+
+# Combine labeled data into DataFrames
+train_data = train_pos_data + train_neg_data
+test_data = test_pos_data + test_neg_data
+
+train_df = pd.DataFrame(train_data, columns=["review", "label"])
+test_df = pd.DataFrame(test_data, columns=["review", "label"])
+
+print(f"Train set size: {train_df.shape}")
+print(f"Test set size: {test_df.shape}")
+print(f"Unsupervised samples count: {len(unsup_texts)}")
+
+
+
+
+
+
+# 4.Clean all datasets
+# 4. Clean all datasets without pandarallel (portable version)
+
+print("Cleaning train reviews...")
+train_df['cleaned'] = train_df['review'].apply(clean_text)  # Normal apply instead of parallel
+
+print("Cleaning test reviews...")
+test_df['cleaned'] = test_df['review'].apply(clean_text)    # Normal apply
+
+print("Cleaning unsupervised reviews...")
+unsup_cleaned = [clean_text(text) for text in unsup_texts]   # List comprehension
+
+print("Cleaning complete.")
+
+
+
+
+# 5.Train Word2Vec embeddings on unsupervised data
+print("Training Word2Vec model on unsupervised data...")
+tokenized_unsup = [text.split() for text in unsup_cleaned]
+
+w2v_model = Word2Vec(
+    sentences=tokenized_unsup,
+    vector_size=100,
+    window=5,
+    min_count=5,
+    workers=os.cpu_count(),
+    epochs=5
+)
+
+w2v_model.save("word2vec_unsup.model")
+print("Word2Vec model trained and saved.")
+
+
+
+# 6.Tokenizer for converting text to numeric sequences
+print("Preparing tokenizer and sequences...")
+all_texts = pd.concat([train_df['cleaned'], test_df['cleaned']])
+
+tokenizer = Tokenizer()
+tokenizer.fit_on_texts(all_texts)
+
+# Convert to sequences and pad
+X_train_seq = tokenizer.texts_to_sequences(train_df['cleaned'])
+X_test_seq = tokenizer.texts_to_sequences(test_df['cleaned'])
+
+max_len = 200
+X_train_pad = pad_sequences(X_train_seq, maxlen=max_len, padding='post')
+X_test_pad = pad_sequences(X_test_seq, maxlen=max_len, padding='post')
+
+# Labels
+y_train = train_df['label'].values
+y_test = test_df['label'].values
+
+print(f"Tokenizer vocab size: {len(tokenizer.word_index) + 1}")
+
+
+
+
+# 7.Create embedding matrix from Word2Vec model
+print("Creating embedding matrix...")
+vocab_size = len(tokenizer.word_index) + 1
+embedding_dim = 100
+
+embedding_matrix = np.zeros((vocab_size, embedding_dim))
+for word, idx in tokenizer.word_index.items():
+    if word in w2v_model.wv:
+        embedding_matrix[idx] = w2v_model.wv[word]
+    else:
+        embedding_matrix[idx] = np.random.normal(size=(embedding_dim,))
+
+print("Embedding matrix created.")
+
+
+
+# 8. Build a BiLSTM model for sentiment classification
+print("Building BiLSTM model...")
+
+model = Sequential([
+    Embedding(input_dim=vocab_size,
+              output_dim=embedding_dim,
+              weights=[embedding_matrix],
+              input_length=max_len,      # ✅ Added so model knows input size
+              trainable=False),
+    Bidirectional(LSTM(128)),
+    Dropout(0.5),
+    Dense(64, activation='relu'),
+    Dropout(0.3),
+    Dense(1, activation='sigmoid')
+])
+
+# Compile model
+model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+# Build model explicitly to show correct shapes
+model.build(input_shape=(None, max_len))  # ✅ This builds the model before summary
+
+# Show model summary
+model.summary()
+
+
+
+
+# 9.Train initial model with callbacks
+print("Training initial model...")
+early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6)
+
+history = model.fit(
+    X_train_pad,
+    y_train,
+    validation_split=0.1,
+    epochs=10,
+    batch_size=64,
+    callbacks=[early_stop, reduce_lr],
+    verbose=1
+)
+
+
+
+# 10.Predict on all unsupervised data and use all confident predictions
+print("Semi-supervised learning: predicting on unsupervised data...")
+
+unsup_seq = tokenizer.texts_to_sequences(unsup_cleaned)
+unsup_pad = pad_sequences(unsup_seq, maxlen=max_len, padding='post')
+
+unsup_preds = model.predict(unsup_pad).flatten()
+
+# Select all confident predictions
+conf_pos_idx = np.where(unsup_preds > 0.9)[0]
+conf_neg_idx = np.where(unsup_preds < 0.1)[0]
+
+print(f"Confident positive samples found: {len(conf_pos_idx)}")
+print(f"Confident negative samples found: {len(conf_neg_idx)}")
+
+# Add confident samples to training data
+new_texts = [unsup_cleaned[i] for i in np.concatenate([conf_pos_idx, conf_neg_idx])]
+new_labels = [1]*len(conf_pos_idx) + [0]*len(conf_neg_idx)
+
+new_seq = tokenizer.texts_to_sequences(new_texts)
+new_pad = pad_sequences(new_seq, maxlen=max_len, padding='post')
+new_labels = np.array(new_labels)
+
+X_train_pad = np.vstack([X_train_pad, new_pad])
+y_train = np.concatenate([y_train, new_labels])
+
+print("Retraining model with extended data...")
+history2 = model.fit(
+    X_train_pad,
+    y_train,
+    validation_split=0.1,
+    epochs=5,
+    batch_size=64,
+    callbacks=[EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)],
+    verbose=1
+)
+
+# 11.Evaluate model performance
+print("Evaluating final model...")
+loss, accuracy = model.evaluate(X_test_pad, y_test)
+print(f"Test accuracy: {accuracy:.4f}")
+
+y_pred = (model.predict(X_test_pad) > 0.5).astype(int)
+print(classification_report(y_test, y_pred))
+
+
+
+
+
+# 12.Save the trained model and tokenizer for future use
+print("Saving model and tokenizer...")
+model.save('sentiment_bilstm.h5')
+
+with open('tokenizer.pkl', 'wb') as f:
+    pickle.dump(tokenizer, f)
+
+print("Saved successfully.")
+
+
+# 13.Load model and tokenizer (use when re-running notebook later)
+print("Loading saved model and tokenizer...")
+loaded_model = load_model('sentiment_bilstm.h5')
+
+with open('tokenizer.pkl', 'rb') as f:
+    loaded_tokenizer = pickle.load(f)
+
+print("Loaded successfully.")
+
+
+# Function to predict sentiment of a custom text
+def predict_sentiment(text):
+    cleaned = clean_text(text)
+    seq = loaded_tokenizer.texts_to_sequences([cleaned])
+    pad_seq = pad_sequences(seq, maxlen=max_len, padding='post')
+    prediction = loaded_model.predict(pad_seq)[0][0]
+    sentiment = "Positive" if prediction > 0.5 else "Negative"
+    return sentiment, prediction
+
+# 14.Example predictions
+examples = [
+    "The movie was absolutely fantastic! Great acting and story.",
+    "This was the worst film I have ever seen. Total waste of time."
+]
+
+for ex in examples:
+    sentiment, score = predict_sentiment(ex)
+    print(f"Review: {ex}")
+    print(f"Predicted Sentiment: {sentiment} (Score: {score:.4f})\n")
